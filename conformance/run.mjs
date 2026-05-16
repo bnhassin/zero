@@ -247,6 +247,7 @@ for (const fixture of [
   "conformance/native/pass/checked-bounds-get.0",
   "conformance/native/pass/check-maybe-fallibility.0",
   "conformance/native/pass/fallibility-error-sets.0",
+  "conformance/native/pass/checked-fallible-wrapper.0",
   "conformance/native/pass/fallibility-check-value.0",
   "conformance/native/pass/rescue-check.0",
   "conformance/native/pass/std-fs-fallible.0",
@@ -2566,6 +2567,10 @@ assert.match(sliceNonSliceable.stderr, /TYP021/);
 for (const [fixture, code] of [
   ["missing-return-path.0", /TYP003/],
   ["check-non-fallible-value.0", /ERR001/],
+  ["unchecked-fallible-wrapper.0", /ERR003/],
+  ["unchecked-fallible-receiver-wrapper.0", /ERR003/],
+  ["error-set-wrapper-mismatch.0", /ERR002/],
+  ["error-set-wrapper-nested-check-mismatch.0", /ERR002/],
   ["unknown-member-on-non-shape.0", /TYP021/],
   ["function-used-as-value.0", /TYP001/],
   ["call-local-value.0", /TYP001/],

@@ -1573,39 +1573,74 @@ static bool function_error_contains(const Function *fun, const char *name) {
   return false;
 }
 
-static bool stmt_vec_raise_errors_covered(const StmtVec *body, const Function *caller, const Expr *call, ZDiag *diag);
+static const Function *fallible_callee(const Program *program, const Expr *expr);
+static bool is_builtin_fallible_call(const Expr *expr);
+static bool function_error_sets_include_builtin(const Function *caller, ZDiag *diag, const Expr *call);
+static bool function_error_sets_compatible_inner(const Function *caller, const Function *callee, ZDiag *diag, const Expr *call, size_t depth);
+static bool stmt_vec_raise_errors_covered(const Program *program, const StmtVec *body, const Function *caller, const Expr *call, ZDiag *diag, size_t depth);
 
-static bool stmt_raise_errors_covered(const Stmt *stmt, const Function *caller, const Expr *call, ZDiag *diag) {
+static bool expr_raise_errors_covered(const Program *program, const Expr *expr, const Function *caller, const Expr *call, ZDiag *diag, size_t depth) {
+  if (!expr || depth > 64) return true;
+  if (expr->kind == EXPR_CHECK) {
+    if (is_builtin_fallible_call(expr->left) && !function_error_sets_include_builtin(caller, diag, call)) return false;
+    const Function *callee = fallible_callee(program, expr->left);
+    if (callee && !function_error_sets_compatible_inner(caller, callee, diag, call, depth + 1)) return false;
+    return expr_raise_errors_covered(program, expr->left, caller, call, diag, depth);
+  }
+  if (expr->kind == EXPR_RESCUE) return expr_raise_errors_covered(program, expr->right, caller, call, diag, depth);
+  if (!expr_raise_errors_covered(program, expr->left, caller, call, diag, depth) ||
+      !expr_raise_errors_covered(program, expr->right, caller, call, diag, depth)) return false;
+  for (size_t i = 0; i < expr->args.len; i++) {
+    if (!expr_raise_errors_covered(program, expr->args.items[i], caller, call, diag, depth)) return false;
+  }
+  for (size_t i = 0; i < expr->fields.len; i++) {
+    if (!expr_raise_errors_covered(program, expr->fields.items[i].value, caller, call, diag, depth)) return false;
+  }
+  return true;
+}
+
+static bool stmt_raise_errors_covered(const Program *program, const Stmt *stmt, const Function *caller, const Expr *call, ZDiag *diag, size_t depth) {
   if (!stmt) return true;
+  if (depth > 64) return true;
   if (stmt->kind == STMT_RAISE && stmt->name && !function_error_contains(caller, stmt->name)) {
     char actual[160];
     snprintf(actual, sizeof(actual), "callee may raise %s", stmt->name);
     return set_diag_detail(diag, 1002, "caller error set does not include inferred callee error", call->line, call->column, "caller raises set containing every checked callee error", actual, "add the missing error to the caller's raises { ... } set");
   }
-  if (!stmt_vec_raise_errors_covered(&stmt->then_body, caller, call, diag)) return false;
-  if (!stmt_vec_raise_errors_covered(&stmt->else_body, caller, call, diag)) return false;
+  if (stmt->kind == STMT_CHECK) {
+    if (is_builtin_fallible_call(stmt->expr) && !function_error_sets_include_builtin(caller, diag, call)) return false;
+    const Function *callee = fallible_callee(program, stmt->expr);
+    if (callee && !function_error_sets_compatible_inner(caller, callee, diag, call, depth + 1)) return false;
+  }
+  if (!expr_raise_errors_covered(program, stmt->target, caller, call, diag, depth) ||
+      !expr_raise_errors_covered(program, stmt->expr, caller, call, diag, depth) ||
+      !expr_raise_errors_covered(program, stmt->range_end, caller, call, diag, depth)) return false;
+  if (!stmt_vec_raise_errors_covered(program, &stmt->then_body, caller, call, diag, depth)) return false;
+  if (!stmt_vec_raise_errors_covered(program, &stmt->else_body, caller, call, diag, depth)) return false;
   for (size_t i = 0; i < stmt->match_arms.len; i++) {
-    if (!stmt_vec_raise_errors_covered(&stmt->match_arms.items[i].body, caller, call, diag)) return false;
+    if (!expr_raise_errors_covered(program, stmt->match_arms.items[i].guard, caller, call, diag, depth) ||
+        !stmt_vec_raise_errors_covered(program, &stmt->match_arms.items[i].body, caller, call, diag, depth)) return false;
   }
   return true;
 }
 
-static bool stmt_vec_raise_errors_covered(const StmtVec *body, const Function *caller, const Expr *call, ZDiag *diag) {
+static bool stmt_vec_raise_errors_covered(const Program *program, const StmtVec *body, const Function *caller, const Expr *call, ZDiag *diag, size_t depth) {
   if (!body) return true;
   for (size_t i = 0; i < body->len; i++) {
-    if (!stmt_raise_errors_covered(body->items[i], caller, call, diag)) return false;
+    if (!stmt_raise_errors_covered(program, body->items[i], caller, call, diag, depth)) return false;
   }
   return true;
 }
 
-static bool function_error_sets_compatible(const Function *caller, const Function *callee, ZDiag *diag, const Expr *call) {
+static bool function_error_sets_compatible_inner(const Function *caller, const Function *callee, ZDiag *diag, const Expr *call, size_t depth) {
   if (!caller || !callee || !callee->raises) return true;
+  if (depth > 64) return true;
   if (!caller->raises) {
     return set_diag_detail(diag, 1001, "fallible call requires function to be marked raises", call->line, call->column, "function signature marked raises", "function is not marked raises", "add raises to the function signature or handle the error locally");
   }
   if (!caller->has_error_set) return true;
   if (!callee->has_error_set) {
-    return stmt_vec_raise_errors_covered(&callee->body, caller, call, diag);
+    return stmt_vec_raise_errors_covered(current_type_program, &callee->body, caller, call, diag, depth + 1);
   }
   for (size_t i = 0; i < callee->errors.len; i++) {
     const char *error_name = callee->errors.items[i].name;
@@ -1618,20 +1653,80 @@ static bool function_error_sets_compatible(const Function *caller, const Functio
   return true;
 }
 
-static bool stmt_vec_has_raise(const StmtVec *body) {
+static bool function_error_sets_compatible(const Function *caller, const Function *callee, ZDiag *diag, const Expr *call) {
+  return function_error_sets_compatible_inner(caller, callee, diag, call, 0);
+}
+
+static bool function_has_error_flow_inner(const Program *program, const Function *fun, size_t depth);
+
+static bool expr_is_world_stream_write_shape(const Expr *expr) {
+  if (!expr || expr->kind != EXPR_CALL || !expr->left || expr->left->kind != EXPR_MEMBER) return false;
+  const Expr *write = expr->left;
+  if (!write->text || strcmp(write->text, "write") != 0) return false;
+  const Expr *stream = write->left;
+  return stream && stream->kind == EXPR_MEMBER && stream->text &&
+         (strcmp(stream->text, "out") == 0 || strcmp(stream->text, "err") == 0);
+}
+
+static bool expr_call_has_error_flow(const Program *program, const Expr *expr, size_t depth) {
+  if (!expr || expr->kind != EXPR_CALL || !expr->left) return false;
+  if (is_builtin_fallible_call(expr) || expr_is_world_stream_write_shape(expr)) return true;
+  const Function *fun = NULL;
+  if (expr->left->kind == EXPR_IDENT) {
+    fun = find_function(program, expr->left->text);
+  } else if (expr->left->kind == EXPR_MEMBER) {
+    fun = find_namespace_shape_method(program, expr->left, NULL);
+    if (!fun && expr->left->left) {
+      const char *receiver_type = expr->left->left->resolved_type;
+      char owner_type[192];
+      strip_ref_like_type(receiver_type, owner_type, sizeof(owner_type));
+      const Shape *shape = find_shape_for_type(program, owner_type);
+      fun = find_shape_method_decl(shape, expr->left->text);
+    }
+  }
+  return function_has_error_flow_inner(program, fun, depth + 1);
+}
+
+static bool expr_has_checked_error_flow(const Program *program, const Expr *expr, size_t depth) {
+  if (!expr) return false;
+  if (expr->kind == EXPR_CHECK && expr_call_has_error_flow(program, expr->left, depth)) return true;
+  if (expr->kind == EXPR_RESCUE) return expr_has_checked_error_flow(program, expr->right, depth);
+  if (expr_has_checked_error_flow(program, expr->left, depth) || expr_has_checked_error_flow(program, expr->right, depth)) return true;
+  for (size_t i = 0; i < expr->args.len; i++) {
+    if (expr_has_checked_error_flow(program, expr->args.items[i], depth)) return true;
+  }
+  for (size_t i = 0; i < expr->fields.len; i++) {
+    if (expr_has_checked_error_flow(program, expr->fields.items[i].value, depth)) return true;
+  }
+  return false;
+}
+
+static bool stmt_vec_has_checked_error_flow(const Program *program, const StmtVec *body, size_t depth) {
+  if (!body || depth > 64) return false;
   for (size_t i = 0; i < body->len; i++) {
     const Stmt *stmt = body->items[i];
+    if (!stmt) continue;
     if (stmt->kind == STMT_RAISE) return true;
-    if (stmt_vec_has_raise(&stmt->then_body) || stmt_vec_has_raise(&stmt->else_body)) return true;
+    if (stmt->kind == STMT_CHECK && expr_call_has_error_flow(program, stmt->expr, depth)) return true;
+    if (expr_has_checked_error_flow(program, stmt->target, depth) ||
+        expr_has_checked_error_flow(program, stmt->expr, depth) ||
+        expr_has_checked_error_flow(program, stmt->range_end, depth)) return true;
+    if (stmt_vec_has_checked_error_flow(program, &stmt->then_body, depth) ||
+        stmt_vec_has_checked_error_flow(program, &stmt->else_body, depth)) return true;
     for (size_t arm_index = 0; arm_index < stmt->match_arms.len; arm_index++) {
-      if (stmt_vec_has_raise(&stmt->match_arms.items[arm_index].body)) return true;
+      if (expr_has_checked_error_flow(program, stmt->match_arms.items[arm_index].guard, depth) ||
+          stmt_vec_has_checked_error_flow(program, &stmt->match_arms.items[arm_index].body, depth)) return true;
     }
   }
   return false;
 }
 
-static bool function_has_error_flow(const Function *fun) {
-  return fun && fun->raises && (fun->has_error_set || stmt_vec_has_raise(&fun->body));
+static bool function_has_error_flow_inner(const Program *program, const Function *fun, size_t depth) {
+  return fun && fun->raises && (fun->has_error_set || stmt_vec_has_checked_error_flow(program, &fun->body, depth));
+}
+
+static bool function_has_error_flow(const Program *program, const Function *fun) {
+  return function_has_error_flow_inner(program, fun, 0);
 }
 
 static const Function *fallible_callee(const Program *program, const Expr *expr) {
@@ -1650,7 +1745,7 @@ static const Function *fallible_callee(const Program *program, const Expr *expr)
       fun = find_shape_method_decl(shape, expr->left->text);
     }
   }
-  return function_has_error_flow(fun) ? fun : NULL;
+  return function_has_error_flow(program, fun) ? fun : NULL;
 }
 
 static bool is_builtin_fallible_call(const Expr *expr) {
@@ -3525,7 +3620,7 @@ static bool check_expr_expected(const Program *program, const Expr *expr, Scope 
               mark_owned_move_if_needed(expr->args.items[i], scope, expected_type);
               free(expected_type);
             }
-            if (function_has_error_flow(receiver_method)) {
+            if (function_has_error_flow(program, receiver_method)) {
               if (allow_fallible_call == 0) {
                 generic_bindings_free(receiver_bindings, receiver_binding_len);
                 free(receiver_bindings);
